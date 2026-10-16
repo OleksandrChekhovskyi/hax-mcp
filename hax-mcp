@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+
+# Replace the script's directory with src/ alone. `python3 -m` would put the working directory on
+# the path instead, where any file named like a module this program imports would shadow it.
+sys.path[0] = os.path.join(os.path.dirname(os.path.realpath(__file__)), "src")
+
+from hax_mcp.cli import run  # noqa: E402
+
+run()
