@@ -1,4 +1,4 @@
-"""Use tools of remote MCP servers from the shell."""
+"""Use tools of MCP servers from the shell."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ JsonValue = Union[JsonPrimitive, list["JsonValue"], dict[str, "JsonValue"]]
 JsonObject = dict[str, JsonValue]
 
 VERSION: Final = "0.1.0"
+PROTOCOL_VERSION: Final = "2026-07-28"
 
 
 class McpError(Exception):

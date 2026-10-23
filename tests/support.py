@@ -11,6 +11,7 @@ import pathlib
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,9 +21,10 @@ from unittest import mock
 ROOT: Final = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from hax_mcp import McpError, auth, cli, config, login  # noqa: E402
+from hax_mcp import McpError, auth, cli, config, local, login  # noqa: E402
 
 Json = Any
+FAKE_STDIO_SERVER: Final = str(ROOT / "tests" / "fake_stdio_server.py")
 
 TOOLS: Final[list[Json]] = [
     {
@@ -273,6 +275,24 @@ def make_handler(fake: FakeServer) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+def process_gone(pid: int, timeout_s: float = 5) -> bool:
+    """Whether the process exits within the timeout; a zombie awaiting its reaper counts."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat") as file:
+                if file.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.02)
+    return False
+
+
 class FakeTty:
     """Readable end of a pipe that claims to be a terminal, for the interactive login."""
 
@@ -305,6 +325,7 @@ class McpTestCase(unittest.TestCase):
         environment = {
             "XDG_CONFIG_HOME": str(self.root / "config"),
             "XDG_STATE_HOME": str(self.root / "state"),
+            "XDG_RUNTIME_DIR": str(self.root / "run"),
         }
         patch = mock.patch.dict(os.environ, environment)
         patch.start()
@@ -316,6 +337,29 @@ class McpTestCase(unittest.TestCase):
         self.addCleanup(fake.close)
         self.configure({"remote": {"url": f"{fake.base}/mcp"}})
         return fake
+
+    def local_entry(self, mode: str = "legacy", **fields: Json) -> Json:
+        """A config entry running fake_stdio_server.py, which logs what it receives."""
+        log = {"FAKE_MCP_LOG": str(self.root / "messages.jsonl")}
+        return {"command": sys.executable, "args": [FAKE_STDIO_SERVER, mode], "env": log, **fields}
+
+    def configure_local(self, mode: str = "legacy", **fields: Json) -> None:
+        """Configure the fake as server "local", and stop any broker the test starts."""
+        self.configure({"local": self.local_entry(mode, **fields)})
+        self.addCleanup(local.stop)
+
+    def local_server(self, name: str = "local") -> config.LocalServer:
+        server = config.get_server(name)
+        assert isinstance(server, config.LocalServer)
+        return server
+
+    def received(self) -> list[Json]:
+        path = self.root / "messages.jsonl"
+        lines = path.read_text().splitlines() if path.exists() else []
+        return [json.loads(line) for line in lines]
+
+    def methods_received(self) -> list[str]:
+        return [message.get("method", "(reply)") for message in self.received()]
 
     def config_file(self) -> pathlib.Path:
         return self.root / "config" / "hax-mcp" / "servers.json"
@@ -349,8 +393,10 @@ class McpTestCase(unittest.TestCase):
                     print(error, file=stderr)
         return code, stdout.getvalue(), stderr.getvalue()
 
-    def server(self) -> config.Server:
-        return config.get_server("remote")
+    def server(self, name: str = "remote") -> config.Server:
+        server = config.get_server(name)
+        assert isinstance(server, config.Server)
+        return server
 
     def credentials(self) -> Json:
         return json.loads(pathlib.Path(auth.credentials_path()).read_text())

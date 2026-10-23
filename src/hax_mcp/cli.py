@@ -2,16 +2,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
 import sys
 from collections.abc import Sequence
-from typing import Optional
+from typing import Optional, Union
 
 from . import VERSION, JsonObject, LoginRequired, McpError
 from .auth import logout, read_credentials
-from .config import add_server, config_path, get_server, load_config, remove_server
+from .config import (
+    LocalServer,
+    Server,
+    add_local_server,
+    add_server,
+    config_path,
+    get_server,
+    load_config,
+    project_dir,
+    remove_server,
+)
+from .local import LocalSession, display_path, format_status, running, stop
 from .login import login
 from .protocol import Session, call_tool, find_tool, list_tools
 from .render import format_result, format_tool, format_tools
+from .stdio import launch
 from .text import dump_json, sanitize_text, write_output
 from .transport import HEADER_NAME
 
@@ -23,11 +37,33 @@ def parse_header(value: str) -> tuple[str, str]:
     return name.strip(), content.strip()
 
 
+def parse_env(value: str) -> tuple[str, str]:
+    name, separator, content = value.partition("=")
+    if not separator or not name:
+        raise argparse.ArgumentTypeError(f"expected 'NAME=value', got {value!r}")
+    return name, content
+
+
+def open_session(server: Union[Server, LocalServer]) -> Union[Session, LocalSession]:
+    return LocalSession(server) if isinstance(server, LocalServer) else Session(server)
+
+
+def count_tools(server: Union[Server, LocalServer]) -> int:
+    """List the server's tools once, without leaving a local server running in the background."""
+    if isinstance(server, LocalServer):
+        process = launch(server, dict(os.environ))
+        try:
+            return len(list_tools(process))
+        finally:
+            process.close()
+    with Session(server) as session:
+        return len(list_tools(session))
+
+
 def check_server(name: str) -> str:
     """Describe whether a newly added server is usable, without failing the addition."""
     try:
-        with Session(get_server(name)) as session:
-            count = len(list_tools(session))
+        count = count_tools(get_server(name))
     except LoginRequired:
         return f"added {name}; log in with: hax-mcp login {name}"
     except McpError as error:
@@ -42,9 +78,14 @@ def format_servers() -> str:
     credentials = read_credentials()
     lines = []
     for name, entry in config.items():
+        command, args = entry.get("command"), entry.get("args", [])
+        if isinstance(command, str):
+            words = [command, *args] if isinstance(args, list) else [command]
+            lines.append(f"{name}  {shlex.join(str(word) for word in words)}")
+            continue
         url = entry.get("url")
         if not isinstance(url, str):
-            lines.append(f"{name}  (unsupported: not a remote server)")
+            lines.append(f"{name}  (invalid: no url or command)")
             continue
         headers = entry.get("headers")
         if isinstance(headers, dict) and any(k.lower() == "authorization" for k in headers):
@@ -70,7 +111,7 @@ def read_arguments(value: Optional[str]) -> JsonObject:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="hax-mcp", description="Use tools of remote MCP servers from the shell."
+        prog="hax-mcp", description="Use tools of MCP servers from the shell."
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
@@ -91,19 +132,51 @@ def build_parser() -> argparse.ArgumentParser:
     call.add_argument("arguments", nargs="?", help="JSON object, or - to read stdin")
     call.add_argument("--json", action="store_true", help="write the raw result as JSON")
 
-    add = commands.add_parser("add", help="add a server to the configuration")
+    add = commands.add_parser(
+        "add",
+        help="add a server to the configuration",
+        usage="%(prog)s [-H 'Name: value'] server url\n"
+        "       %(prog)s [-e NAME=value] server [--] command [arg ...]",
+        description="Add a remote server by URL, or a local one by the command that runs it. "
+        "Put -- before a command whose arguments start with -.",
+    )
     add.add_argument("server")
-    add.add_argument("url")
+    add.add_argument("target", nargs="+", metavar="url | command [arg ...]")
     add.add_argument(
         "-H",
         "--header",
         action="append",
         default=[],
         type=parse_header,
-        help="'Name: value' header; ${VAR} is read from the environment",
+        metavar="'Name: value'",
+        help="header of a remote server; ${VAR} is read from the environment",
+    )
+    add.add_argument(
+        "-e",
+        "--env",
+        action="append",
+        default=[],
+        type=parse_env,
+        metavar="NAME=value",
+        help="variable for a local server; ${VAR} is read from the environment",
     )
     remove = commands.add_parser("remove", help="remove a server and its login")
     remove.add_argument("server")
+
+    commands.add_parser("status", help="list running local servers")
+    stop_parser = commands.add_parser(
+        "stop",
+        help="stop running local servers, all of them by default",
+        description="Stop running local servers. Their state is lost; the next use of a server "
+        "starts it again.",
+    )
+    stop_parser.add_argument("server", nargs="?", help="stop only this server")
+    stop_parser.add_argument(
+        "-C",
+        "--dir",
+        metavar="DIR",
+        help="stop only instances working in DIR or in the project containing it",
+    )
 
     login_parser = commands.add_parser("login", help="log in to a server (interactive)")
     login_parser.add_argument("server")
@@ -118,13 +191,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         write_output(format_servers())
         return 0
     if args.command == "add":
-        add_server(args.server, args.url, dict(args.header))
+        target: list[str] = args.target
+        # Classify by the expanded value, so '${MCP_URL}' is a URL; the entry keeps it as typed.
+        if "://" in os.path.expandvars(target[0]):
+            if len(target) > 1:
+                raise McpError("a remote server takes a URL alone")
+            if args.env:
+                raise McpError("-e applies only to local servers")
+            add_server(args.server, target[0], dict(args.header))
+        else:
+            if args.header:
+                raise McpError("-H applies only to remote servers")
+            add_local_server(args.server, target, dict(args.env))
         print(check_server(args.server))
         return 0
     if args.command == "remove":
         remove_server(args.server)
         logout(args.server)
+        stop(args.server)
         print(f"removed {args.server}")
+        return 0
+    if args.command == "status":
+        write_output(format_status(running()))
+        return 0
+    if args.command == "stop":
+        stopped = stop(args.server, args.dir)
+        for entry in stopped:
+            print(f"stopped {entry['name']} in {display_path(str(entry['cwd']))}")
+        if not stopped:
+            where = f" in {display_path(project_dir(args.dir))}" if args.dir else ""
+            subject = f"{args.server} is not" if args.server else "no local servers are"
+            print(f"{subject} running{where}")
         return 0
 
     if args.command == "logout":
@@ -134,11 +231,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     server = get_server(args.server)
     if args.command == "login":
+        if isinstance(server, LocalServer):
+            raise McpError(f"{server.name} is a local server, which needs no login")
         login(server)
         print(f"logged in to {server.name}")
         return 0
 
-    with Session(server) as session:
+    with open_session(server) as session:
         if args.command == "tools":
             tools = list_tools(session)
             write_output(dump_json(tools) if args.json else format_tools(tools), args.json)

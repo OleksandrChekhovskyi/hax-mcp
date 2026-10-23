@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import pathlib
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from support import ROOT, TOOLS, FakeServer, McpTestCase
 from hax_mcp import VERSION
@@ -26,7 +28,7 @@ class CommandTests(McpTestCase):
             [
                 f"remote  {fake.base}/mcp  [logged in]",
                 "gh  https://example.com/mcp  [token]",
-                "local  (unsupported: not a remote server)",
+                "local  npx",
             ],
         )
 
@@ -67,6 +69,15 @@ class EditTests(McpTestCase):
         code, stdout, _ = self.run_cli("add", "remote", f"{fake.base}/mcp", "-H", "X-Key: k")
         self.assertEqual((code, stdout), (0, f"added remote ({len(TOOLS)} tools)\n"))
         self.assertEqual(self.server().headers, {"X-Key": "k"})
+
+    def test_add_takes_a_url_from_an_environment_variable(self) -> None:
+        fake = FakeServer()
+        self.addCleanup(fake.close)
+        with mock.patch.dict(os.environ, {"MCP_URL": f"{fake.base}/mcp"}):
+            code, stdout, _ = self.run_cli("add", "remote", "${MCP_URL}")
+            self.assertEqual((code, stdout), (0, f"added remote ({len(TOOLS)} tools)\n"))
+        servers = json.loads(self.config_file().read_text())["mcpServers"]
+        self.assertEqual(servers, {"remote": {"url": "${MCP_URL}"}})
 
     def test_add_points_at_login_when_required(self) -> None:
         fake = FakeServer(token="unset")
